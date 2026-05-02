@@ -1,118 +1,100 @@
-#! python3.7
-# -*- coding: utf-8 -*-
+import torch
+import torch.nn as nn
+import numpy as np
+import matplotlib.pyplot as plt
 
-import matplotlib
-matplotlib.use('TkAgg')
-
-from numpy import zeros, linspace, exp, linalg, real
-from matplotlib.pyplot import style, figure, axes, show
-from celluloid import Camera
+alpha = 0.015  # коэффициент теплопроводности
 
 
-def u_init(x):
-    return -x + 1.0
+class PINN(nn.Module):
+    def __init__(self):
+        super(PINN, self).__init__()
+        self.net = nn.Sequential(
+            nn.Linear(2, 50),
+            nn.Tanh(),
+            nn.Linear(50, 50),
+            nn.Tanh(),
+            nn.Linear(50, 50),
+            nn.Tanh(),
+            nn.Linear(50, 1),
+        )
+
+    def forward(self, x, t):
+
+        inputs = torch.cat([x, t], dim=1)
+        return self.net(inputs)
 
 
-def u_left(t):
-    return exp(-t)
+model = PINN()
+optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 
+# (физический лосс)
+N_f = 1000
+x_f = torch.rand(N_f, 1) * 1.0
+T_MAX = 5.0
+t_f = torch.rand(N_f, 1) * T_MAX
+N_ic = 1000
+x_ic = torch.rand(N_ic, 1) * 1.0
+t_ic = torch.zeros(N_ic, 1)
 
-# y = (u1, u2, ..., uN, u0)
-def f(y, t, h):
-    f_val = zeros(N + 1)
+# значения температуры в начальный момент
+u_ic_true = torch.sin(np.pi * x_ic)
 
-    # Уравнение для u1: слева стоит граничное значение u0
-    f_val[0] = exp(y[0] ** 2) - y[0] * (y[0] - y[N]) / h
+for epoch in range(5000):
+    optimizer.zero_grad()
 
-    # Уравнения для u2, ..., uN
-    for n in range(1, N):
-        f_val[n] = exp(y[n] ** 2) - y[n] * (y[n] - y[n - 1]) / h
+    x_f.requires_grad = True
+    t_f.requires_grad = True
 
-    # Алгебраическое уравнение: u0 = u_left(t)
-    f_val[N] = y[N] - u_left(t)
+    u = model(x_f, t_f)
 
-    return f_val
+    u_t = torch.autograd.grad(
+        u, t_f, grad_outputs=torch.ones_like(u), create_graph=True
+    )[0]
 
+    u_x = torch.autograd.grad(
+        u, x_f, grad_outputs=torch.ones_like(u), create_graph=True
+    )[0]
 
-def f_y(y, t, h):
-    jac = zeros((N + 1, N + 1))
+    u_xx = torch.autograd.grad(
+        u_x, x_f, grad_outputs=torch.ones_like(u_x), create_graph=True
+    )[0]
 
-    # Производные для первого уравнения (u1)
-    jac[0, 0] = (-2.0 * y[0] + y[N]) / h + 2.0 * y[0] * exp(y[0] ** 2)
-    jac[0, N] = y[0] / h
+    residual = u_t - alpha * u_xx
+    loss_physics = torch.mean(residual**2)
 
-    # Производные для уравнений u2, ..., uN
-    for n in range(1, N):
-        jac[n, n] = (-2.0 * y[n] + y[n - 1]) / h + 2.0 * y[n] * exp(y[n] ** 2)
-        jac[n, n - 1] = y[n] / h
+    u_ic_pred = model(x_ic, t_ic)
+    loss_ic = torch.mean((u_ic_pred - u_ic_true) ** 2)
+    total_loss = loss_physics + loss_ic
 
-    # Производная алгебраического уравнения
-    jac[N, N] = 1.0
+    # Обратное распространение
+    total_loss.backward()
+    optimizer.step()
 
-    return jac
+    if epoch % 1000 == 0:
+        print(f"ЦИкл {epoch:4d}, Loss: {loss_physics.item():.4e}")
 
+print("Обучение завершено")
 
-def D_matrix():
-    d = zeros((N + 1, N + 1))
-    for i in range(N):
-        d[i, i] = 1.0
-    return d
+# Тестовые данные: температура в начальный момент времени u(x,0)
+x_test = torch.linspace(0, 1, 100).reshape(-1, 1)
+t_test = torch.zeros_like(x_test)
 
+model.eval()
+with torch.no_grad():
+    u_pred = model(x_test, t_test).numpy()
 
-a = 0.0
-b = 1.0
-t_0 = 0.0
-T = 0.3
+t_moments = [0, 0.5, 1.0, 2.0, 3.0, 4.0, 5.0]
 
-alpha = (1.0 + 1.0j) / 2.0   # CROS1
-# alpha = 1.0                # DIRK1
+plt.figure(figsize=(10, 6))
+for t_val in t_moments:
+    t_test = torch.ones_like(x_test) * t_val
+    u_pred = model(x_test, t_test).detach().numpy()
+    plt.plot(x_test.numpy(), u_pred, label=f"t = {t_val}")
 
-N = 200
-M = 300
-
-h = (b - a) / N
-x = linspace(a, b, N + 1)
-
-tau = (T - t_0) / M
-t = linspace(t_0, T, M + 1)
-
-# Y[m] = (u1, u2, ..., uN, u0)
-Y = zeros((M + 1, N + 1))
-
-# Начальное условие
-for n in range(N):
-    Y[0, n] = u_init(x[n + 1])
-
-Y[0, N] = u_left(t_0)
-
-D = D_matrix()
-
-for m in range(M):
-    J = f_y(Y[m], t[m], h)
-    rhs = f(Y[m], t[m] + tau / 2.0, h)
-
-    w_1 = linalg.solve(D - alpha * tau * J, rhs)
-    Y[m + 1] = Y[m] + tau * real(w_1)
-
-    # Поддерживаем алгебраическое ограничение
-    Y[m + 1, N] = u_left(t[m + 1])
-
-# Сборка для графика: (u0, u1, ..., uN)
-U = zeros((M + 1, N + 1))
-U[:, 0] = Y[:, N]
-U[:, 1:] = Y[:, :N]
-
-style.use('dark_background')
-fig = figure()
-camera = Camera(fig)
-ax = axes(xlim=(a, b), ylim=(0.0, 3.0))
-ax.set_xlabel('x')
-ax.set_ylabel('u')
-
-for m in range(M + 1):
-    ax.plot(x, U[m], color='y', ls='-', lw=2)
-    camera.snap()
-
-animation = camera.animate(interval=20, repeat=False, blit=False)
-
-show()
+plt.xlabel("x (координата)")
+plt.ylabel("Температура")
+plt.title("Распределение температуры в разные моменты времени")
+plt.legend()
+plt.grid(True)
+plt.show()
